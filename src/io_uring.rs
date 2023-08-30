@@ -1,12 +1,15 @@
 use crossbeam_deque::{Injector, Steal};
 use io_uring::opcode::{
-    Accept, Connect, EpollCtl, Fsync, OpenAt, Read, Readv, Recv, RecvMsg, Send, SendMsg, Timeout,
-    TimeoutRemove, TimeoutUpdate, Write, Writev,
+    Accept, AsyncCancel, Close, Connect, EpollCtl, Fsync, MkDirAt, OpenAt, Read, Readv, Recv,
+    RecvMsg, RenameAt, Send, SendMsg, Shutdown, Socket, Timeout, TimeoutRemove, TimeoutUpdate,
+    Write, Writev,
 };
 use io_uring::squeue::Entry;
 use io_uring::types::{epoll_event, Fd, Timespec};
 use io_uring::{CompletionQueue, IoUring, Probe};
-use libc::{c_int, c_void, iovec, msghdr, off_t, size_t, sockaddr, socklen_t};
+use libc::{
+    c_char, c_int, c_uint, c_void, iovec, mode_t, msghdr, off_t, size_t, sockaddr, socklen_t,
+};
 use once_cell::sync::Lazy;
 use std::fmt::{Debug, Formatter};
 use std::io::{Error, ErrorKind};
@@ -47,7 +50,13 @@ macro_rules! support {
     };
 }
 
+static SUPPORT_ASYNC_CANCEL: Lazy<bool> = support!(AsyncCancel);
+
 static SUPPORT_OPENAT: Lazy<bool> = support!(OpenAt);
+
+static SUPPORT_MK_DIR_AT: Lazy<bool> = support!(MkDirAt);
+
+static SUPPORT_RENAME_AT: Lazy<bool> = support!(RenameAt);
 
 static SUPPORT_FSYNC: Lazy<bool> = support!(Fsync);
 
@@ -59,9 +68,15 @@ static SUPPORT_TIMEOUT_REMOVE: Lazy<bool> = support!(TimeoutRemove);
 
 static SUPPORT_EPOLL_CTL: Lazy<bool> = support!(EpollCtl);
 
+static SUPPORT_SOCKET: Lazy<bool> = support!(Socket);
+
 static SUPPORT_ACCEPT: Lazy<bool> = support!(Accept);
 
 static SUPPORT_CONNECT: Lazy<bool> = support!(Connect);
+
+static SUPPORT_SHUTDOWN: Lazy<bool> = support!(Shutdown);
+
+static SUPPORT_CLOSE: Lazy<bool> = support!(Close);
 
 static SUPPORT_RECV: Lazy<bool> = support!(Recv);
 
@@ -95,6 +110,17 @@ impl IoUringOperator {
         if unsafe { self.io_uring.submission_shared().push(entry).is_err() } {
             self.backlog.push(entry);
         }
+    }
+
+    pub fn async_cancel(&self, user_data: usize) -> std::io::Result<()> {
+        if *SUPPORT_ASYNC_CANCEL {
+            let entry = AsyncCancel::new(user_data as u64)
+                .build()
+                .user_data(user_data as u64);
+            self.push_sq(entry);
+            return Ok(());
+        }
+        Err(Error::new(ErrorKind::Unsupported, "unsupported"))
     }
 
     /// select impl
@@ -234,6 +260,62 @@ impl IoUringOperator {
         Err(Error::new(ErrorKind::Unsupported, "unsupported"))
     }
 
+    pub fn mkdirat(
+        &self,
+        user_data: usize,
+        dir_fd: c_int,
+        pathname: *const c_char,
+        mode: mode_t,
+    ) -> std::io::Result<()> {
+        if *SUPPORT_MK_DIR_AT {
+            let entry = MkDirAt::new(Fd(dir_fd), pathname)
+                .mode(mode)
+                .build()
+                .user_data(user_data as u64);
+            self.push_sq(entry);
+            return Ok(());
+        }
+        Err(Error::new(ErrorKind::Unsupported, "unsupported"))
+    }
+
+    pub fn renameat(
+        &self,
+        user_data: usize,
+        old_dir_fd: c_int,
+        old_path: *const c_char,
+        new_dir_fd: c_int,
+        new_path: *const c_char,
+    ) -> std::io::Result<()> {
+        if *SUPPORT_RENAME_AT {
+            let entry = RenameAt::new(Fd(old_dir_fd), old_path, Fd(new_dir_fd), new_path)
+                .build()
+                .user_data(user_data as u64);
+            self.push_sq(entry);
+            return Ok(());
+        }
+        Err(Error::new(ErrorKind::Unsupported, "unsupported"))
+    }
+
+    pub fn renameat2(
+        &self,
+        user_data: usize,
+        old_dir_fd: c_int,
+        old_path: *const c_char,
+        new_dir_fd: c_int,
+        new_path: *const c_char,
+        flags: c_uint,
+    ) -> std::io::Result<()> {
+        if *SUPPORT_RENAME_AT {
+            let entry = RenameAt::new(Fd(old_dir_fd), old_path, Fd(new_dir_fd), new_path)
+                .flags(flags)
+                .build()
+                .user_data(user_data as u64);
+            self.push_sq(entry);
+            return Ok(());
+        }
+        Err(Error::new(ErrorKind::Unsupported, "unsupported"))
+    }
+
     pub fn fsync(&self, user_data: usize, fd: c_int) -> std::io::Result<()> {
         if *SUPPORT_FSYNC {
             let entry = Fsync::new(Fd(fd)).build().user_data(user_data as u64);
@@ -244,6 +326,23 @@ impl IoUringOperator {
     }
 
     /// socket
+
+    pub fn socket(
+        &self,
+        user_data: usize,
+        domain: c_int,
+        ty: c_int,
+        protocol: c_int,
+    ) -> std::io::Result<()> {
+        if *SUPPORT_SOCKET {
+            let entry = Socket::new(domain, ty, protocol)
+                .build()
+                .user_data(user_data as u64);
+            self.push_sq(entry);
+            return Ok(());
+        }
+        Err(Error::new(ErrorKind::Unsupported, "unsupported"))
+    }
 
     pub fn accept(
         &self,
@@ -292,6 +391,26 @@ impl IoUringOperator {
             let entry = Connect::new(Fd(socket), address, len)
                 .build()
                 .user_data(user_data as u64);
+            self.push_sq(entry);
+            return Ok(());
+        }
+        Err(Error::new(ErrorKind::Unsupported, "unsupported"))
+    }
+
+    pub fn shutdown(&self, user_data: usize, socket: c_int, how: c_int) -> std::io::Result<()> {
+        if *SUPPORT_SHUTDOWN {
+            let entry = Shutdown::new(Fd(socket), how)
+                .build()
+                .user_data(user_data as u64);
+            self.push_sq(entry);
+            return Ok(());
+        }
+        Err(Error::new(ErrorKind::Unsupported, "unsupported"))
+    }
+
+    pub fn close(&self, user_data: usize, fd: c_int) -> std::io::Result<()> {
+        if *SUPPORT_CLOSE {
+            let entry = Close::new(Fd(fd)).build().user_data(user_data as u64);
             self.push_sq(entry);
             return Ok(());
         }

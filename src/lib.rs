@@ -15,6 +15,7 @@ mod tests {
     use std::time::Duration;
     use std::{io, ptr};
 
+    use crate::io_uring::IoUringOperator;
     use io_uring::{opcode, squeue, types, IoUring, SubmissionQueue};
     use slab::Slab;
 
@@ -65,12 +66,12 @@ mod tests {
         }
     }
 
-    fn crate_server(server_started: Arc<AtomicBool>) -> anyhow::Result<()> {
+    pub fn crate_server(port: u16, server_started: Arc<AtomicBool>) -> anyhow::Result<()> {
         let mut ring: IoUring = IoUring::builder()
             .setup_sqpoll(1000)
             .setup_sqpoll_cpu(0)
             .build(1024)?;
-        let listener = TcpListener::bind(("127.0.0.1", 3456))?;
+        let listener = TcpListener::bind(("127.0.0.1", port))?;
 
         let mut backlog = VecDeque::new();
         let mut bufpool = Vec::with_capacity(64);
@@ -249,10 +250,10 @@ mod tests {
         }
     }
 
-    pub fn crate_client(server_started: Arc<AtomicBool>) {
+    pub fn crate_client(port: u16, server_started: Arc<AtomicBool>) {
         //等服务端起来
         while !server_started.load(Ordering::Acquire) {}
-        let socket = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 3456);
+        let socket = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port);
         let mut stream = TcpStream::connect_timeout(&socket, Duration::from_secs(3))
             .unwrap_or_else(|_| panic!("connect to 127.0.0.1:3456 failed !"));
         let mut data: [u8; 512] = [b'1'; 512];
@@ -282,10 +283,140 @@ mod tests {
 
     #[test]
     fn original() -> anyhow::Result<()> {
+        let port = 8888;
         let server_started = Arc::new(AtomicBool::new(false));
         let clone = server_started.clone();
-        let handle = std::thread::spawn(|| crate_server(clone));
-        std::thread::spawn(|| crate_client(server_started))
+        let handle = std::thread::spawn(move || crate_server(port, clone));
+        std::thread::spawn(move || crate_client(port, server_started))
+            .join()
+            .expect("client has error");
+        handle.join().expect("server has error")
+    }
+
+    pub fn crate_server2(port: u16, server_started: Arc<AtomicBool>) -> anyhow::Result<()> {
+        let operator = IoUringOperator::new(0)?;
+        let listener = TcpListener::bind(("127.0.0.1", port))?;
+
+        let mut bufpool = Vec::with_capacity(64);
+        let mut buf_alloc = Slab::with_capacity(64);
+        let mut token_alloc = Slab::with_capacity(64);
+
+        println!("listen {}", listener.local_addr()?);
+        server_started.store(true, Ordering::Release);
+
+        operator.accept(
+            token_alloc.insert(Token::Accept),
+            listener.as_raw_fd(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )?;
+
+        loop {
+            let mut r = operator.select(None)?;
+
+            for cqe in &mut r.1 {
+                let ret = cqe.result();
+                let token_index = cqe.user_data() as usize;
+
+                if ret < 0 {
+                    eprintln!(
+                        "token {:?} error: {:?}",
+                        token_alloc.get(token_index),
+                        io::Error::from_raw_os_error(-ret)
+                    );
+                    continue;
+                }
+
+                let token = &mut token_alloc[token_index];
+                match token.clone() {
+                    Token::Accept => {
+                        println!("accept");
+
+                        let fd = ret;
+                        let poll_token = token_alloc.insert(Token::Poll { fd });
+
+                        operator.poll_add(poll_token, fd, libc::POLLIN as _)?;
+                    }
+                    Token::Poll { fd } => {
+                        let (buf_index, buf) = match bufpool.pop() {
+                            Some(buf_index) => (buf_index, &mut buf_alloc[buf_index]),
+                            None => {
+                                let buf = vec![0u8; 2048].into_boxed_slice();
+                                let buf_entry = buf_alloc.vacant_entry();
+                                let buf_index = buf_entry.key();
+                                (buf_index, buf_entry.insert(buf))
+                            }
+                        };
+
+                        *token = Token::Read { fd, buf_index };
+
+                        operator.recv(token_index, fd, buf.as_mut_ptr() as _, buf.len(), 0)?;
+                    }
+                    Token::Read { fd, buf_index } => {
+                        if ret == 0 {
+                            bufpool.push(buf_index);
+                            token_alloc.remove(token_index);
+                            println!("shutdown connection");
+                            unsafe { libc::close(fd) };
+
+                            println!("Server closed");
+                            return Ok(());
+                        } else {
+                            let len = ret as usize;
+                            let buf = &buf_alloc[buf_index];
+
+                            *token = Token::Write {
+                                fd,
+                                buf_index,
+                                len,
+                                offset: 0,
+                            };
+
+                            operator.send(token_index, fd, buf.as_ptr() as _, len, 0)?;
+                        }
+                    }
+                    Token::Write {
+                        fd,
+                        buf_index,
+                        offset,
+                        len,
+                    } => {
+                        let write_len = ret as usize;
+
+                        if offset + write_len >= len {
+                            bufpool.push(buf_index);
+
+                            *token = Token::Poll { fd };
+
+                            operator.poll_add(token_index, fd, libc::POLLIN as _)?;
+                        } else {
+                            let offset = offset + write_len;
+                            let len = len - offset;
+
+                            let buf = &buf_alloc[buf_index][offset..];
+
+                            *token = Token::Write {
+                                fd,
+                                buf_index,
+                                offset,
+                                len,
+                            };
+
+                            operator.write(token_index, fd, buf.as_ptr() as _, len)?;
+                        };
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn framework() -> anyhow::Result<()> {
+        let port = 8899;
+        let server_started = Arc::new(AtomicBool::new(false));
+        let clone = server_started.clone();
+        let handle = std::thread::spawn(move || crate_server2(port, clone));
+        std::thread::spawn(move || crate_client(port, server_started))
             .join()
             .expect("client has error");
         handle.join().expect("server has error")

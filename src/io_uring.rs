@@ -1,8 +1,7 @@
-use crossbeam_deque::{Injector, Steal};
 use io_uring::opcode::{
-    Accept, AsyncCancel, Close, Connect, EpollCtl, Fsync, MkDirAt, OpenAt, Read, Readv, Recv,
-    RecvMsg, RenameAt, Send, SendMsg, Shutdown, Socket, Timeout, TimeoutRemove, TimeoutUpdate,
-    Write, Writev,
+    Accept, AsyncCancel, Close, Connect, EpollCtl, Fsync, MkDirAt, OpenAt, PollAdd, PollRemove,
+    Read, Readv, Recv, RecvMsg, RenameAt, Send, SendMsg, Shutdown, Socket, Timeout, TimeoutRemove,
+    TimeoutUpdate, Write, Writev,
 };
 use io_uring::squeue::Entry;
 use io_uring::types::{epoll_event, Fd, Timespec};
@@ -11,13 +10,15 @@ use libc::{
     c_char, c_int, c_uint, c_void, iovec, mode_t, msghdr, off_t, size_t, sockaddr, socklen_t,
 };
 use once_cell::sync::Lazy;
+use std::collections::VecDeque;
 use std::fmt::{Debug, Formatter};
 use std::io::{Error, ErrorKind};
+use std::sync::Mutex;
 use std::time::Duration;
 
 pub struct IoUringOperator {
     io_uring: IoUring,
-    backlog: Injector<&'static Entry>,
+    backlog: Mutex<VecDeque<&'static Entry>>,
 }
 
 impl Debug for IoUringOperator {
@@ -68,6 +69,10 @@ static SUPPORT_TIMEOUT_REMOVE: Lazy<bool> = support!(TimeoutRemove);
 
 static SUPPORT_EPOLL_CTL: Lazy<bool> = support!(EpollCtl);
 
+static SUPPORT_POLL_ADD: Lazy<bool> = support!(PollAdd);
+
+static SUPPORT_POLL_REMOVE: Lazy<bool> = support!(PollRemove);
+
 static SUPPORT_SOCKET: Lazy<bool> = support!(Socket);
 
 static SUPPORT_ACCEPT: Lazy<bool> = support!(Accept);
@@ -101,14 +106,14 @@ impl IoUringOperator {
                 .setup_sqpoll(1000)
                 .setup_sqpoll_cpu(cpu)
                 .build(1024)?,
-            backlog: Injector::new(),
+            backlog: Mutex::new(VecDeque::new()),
         })
     }
 
     fn push_sq(&self, entry: Entry) {
         let entry = Box::leak(Box::new(entry));
         if unsafe { self.io_uring.submission_shared().push(entry).is_err() } {
-            self.backlog.push(entry);
+            self.backlog.lock().unwrap().push_back(entry);
         }
     }
 
@@ -128,7 +133,16 @@ impl IoUringOperator {
     pub fn select(&self, timeout: Option<Duration>) -> std::io::Result<(usize, CompletionQueue)> {
         if crate::version::support_io_uring() {
             self.timeout_add(0, timeout)?;
-            let r = self.io_uring.submit_and_wait(1);
+            let count = match self.io_uring.submit_and_wait(1) {
+                Ok(count) => count,
+                Err(err) => {
+                    if err.raw_os_error() == Some(libc::EBUSY) {
+                        0
+                    } else {
+                        return Err(err);
+                    }
+                }
+            };
             let mut cq = unsafe { self.io_uring.completion_shared() };
             cq.sync();
 
@@ -148,25 +162,23 @@ impl IoUringOperator {
                 }
                 sq.sync();
 
-                loop {
-                    match self.backlog.steal() {
-                        Steal::Success(sqe) => {
-                            if unsafe { sq.push(sqe).is_err() } {
-                                self.backlog.push(sqe);
-                                break;
-                            }
+                let mut backlog = self.backlog.lock().unwrap();
+                match backlog.pop_front() {
+                    Some(sqe) => {
+                        if unsafe { sq.push(&sqe).is_err() } {
+                            backlog.push_front(sqe);
+                            break;
                         }
-                        Steal::Retry => continue,
-                        Steal::Empty => break,
                     }
+                    None => break,
                 }
             }
-            return r.map(|count| (count, cq));
+            return Ok((count, cq));
         }
         Err(Error::new(ErrorKind::Unsupported, "unsupported"))
     }
 
-    /// epoll
+    /// poll
 
     pub fn epoll_ctl(
         &self,
@@ -185,6 +197,28 @@ impl IoUringOperator {
             )
             .build()
             .user_data(user_data as u64);
+            self.push_sq(entry);
+            return Ok(());
+        }
+        Err(Error::new(ErrorKind::Unsupported, "unsupported"))
+    }
+
+    pub fn poll_add(&self, user_data: usize, fd: c_int, flags: c_int) -> std::io::Result<()> {
+        if *SUPPORT_POLL_ADD {
+            let entry = PollAdd::new(Fd(fd), flags as u32)
+                .build()
+                .user_data(user_data as u64);
+            self.push_sq(entry);
+            return Ok(());
+        }
+        Err(Error::new(ErrorKind::Unsupported, "unsupported"))
+    }
+
+    pub fn poll_remove(&self, user_data: usize) -> std::io::Result<()> {
+        if *SUPPORT_POLL_REMOVE {
+            let entry = PollRemove::new(user_data as u64)
+                .build()
+                .user_data(user_data as u64);
             self.push_sq(entry);
             return Ok(());
         }
@@ -244,9 +278,9 @@ impl IoUringOperator {
         &self,
         user_data: usize,
         dir_fd: c_int,
-        pathname: *const libc::c_char,
+        pathname: *const c_char,
         flags: c_int,
-        mode: libc::mode_t,
+        mode: mode_t,
     ) -> std::io::Result<()> {
         if *SUPPORT_OPENAT {
             let entry = OpenAt::new(Fd(dir_fd), pathname)

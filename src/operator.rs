@@ -1,7 +1,7 @@
 use io_uring::opcode::{
     Accept, AsyncCancel, Close, Connect, EpollCtl, Fsync, MkDirAt, OpenAt, PollAdd, PollRemove,
-    Read, Readv, Recv, RecvMsg, RenameAt, Send, SendMsg, Shutdown, Socket, Timeout, TimeoutRemove,
-    TimeoutUpdate, Write, Writev,
+    Read, Readv, Recv, RecvMsg, RenameAt, Send, SendMsg, SendZc, Shutdown, Socket, Timeout,
+    TimeoutRemove, TimeoutUpdate, Write, Writev,
 };
 use io_uring::squeue::Entry;
 use io_uring::types::{epoll_event, Fd, Timespec};
@@ -16,17 +16,26 @@ use std::io::{Error, ErrorKind};
 use std::sync::Mutex;
 use std::time::Duration;
 
-pub struct IoUringOperator {
-    io_uring: IoUring,
-    backlog: Mutex<VecDeque<&'static Entry>>,
+pub struct Operator<'o> {
+    inner: IoUring,
+    backlog: Mutex<VecDeque<&'o Entry>>,
 }
 
-impl Debug for IoUringOperator {
+impl Debug for Operator<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("IoUringSelector")
+        f.debug_struct("Operator")
             .field("backlog", &self.backlog)
             .finish()
     }
+}
+
+static SUPPORT: Lazy<bool> = Lazy::new(|| {
+    crate::version::current_kernel_version() >= crate::version::kernel_version(5, 6, 0)
+});
+
+#[must_use]
+pub fn support_io_uring() -> bool {
+    *SUPPORT
 }
 
 static PROBE: Lazy<Probe> = Lazy::new(|| {
@@ -43,7 +52,7 @@ static PROBE: Lazy<Probe> = Lazy::new(|| {
 macro_rules! support {
     ( $opcode:ident ) => {
         once_cell::sync::Lazy::new(|| {
-            if crate::version::support_io_uring() {
+            if support_io_uring() {
                 return PROBE.is_supported(io_uring::opcode::$opcode::CODE);
             }
             false
@@ -93,47 +102,62 @@ static SUPPORT_RECVMSG: Lazy<bool> = support!(RecvMsg);
 
 static SUPPORT_SEND: Lazy<bool> = support!(Send);
 
+static SUPPORT_SEND_ZC: Lazy<bool> = support!(SendZc);
+
 static SUPPORT_WRITE: Lazy<bool> = support!(Write);
 
 static SUPPORT_WRITEV: Lazy<bool> = support!(Writev);
 
 static SUPPORT_SENDMSG: Lazy<bool> = support!(SendMsg);
 
-impl IoUringOperator {
-    pub fn new(cpu: u32) -> std::io::Result<Self> {
-        Ok(IoUringOperator {
-            io_uring: IoUring::builder()
-                .setup_sqpoll(1000)
-                .setup_sqpoll_cpu(cpu)
-                .build(1024)?,
+// check https://www.rustwiki.org.cn/en/reference/introduction.html for help information
+macro_rules! impl_if_support {
+    ( $support:expr, $impls:expr ) => {
+        return {
+            if $support {
+                $impls
+            }
+            Err(Error::new(ErrorKind::Unsupported, "unsupported"))
+        }
+    };
+}
+
+impl Operator<'_> {
+    pub fn new(_cpu: u32) -> std::io::Result<Self> {
+        Ok(Operator {
+            inner: IoUring::builder().build(1024)?,
             backlog: Mutex::new(VecDeque::new()),
         })
     }
 
-    fn push_sq(&self, entry: Entry) {
+    fn push_sq(&self, entry: Entry) -> std::io::Result<()> {
         let entry = Box::leak(Box::new(entry));
-        if unsafe { self.io_uring.submission_shared().push(entry).is_err() } {
+        if unsafe { self.inner.submission_shared().push(entry).is_err() } {
             self.backlog.lock().unwrap().push_back(entry);
         }
+        self.inner.submit().map(|_| ())
     }
 
     pub fn async_cancel(&self, user_data: usize) -> std::io::Result<()> {
-        if *SUPPORT_ASYNC_CANCEL {
+        impl_if_support!(*SUPPORT_ASYNC_CANCEL, {
             let entry = AsyncCancel::new(user_data as u64)
                 .build()
                 .user_data(user_data as u64);
-            self.push_sq(entry);
-            return Ok(());
-        }
-        Err(Error::new(ErrorKind::Unsupported, "unsupported"))
+            return self.push_sq(entry);
+        })
     }
 
     /// select impl
 
     pub fn select(&self, timeout: Option<Duration>) -> std::io::Result<(usize, CompletionQueue)> {
-        if crate::version::support_io_uring() {
+        impl_if_support!(support_io_uring(), {
+            let mut sq = unsafe { self.inner.submission_shared() };
+            let mut cq = unsafe { self.inner.completion_shared() };
+            if sq.is_empty() {
+                return Ok((0, cq));
+            }
             self.timeout_add(0, timeout)?;
-            let count = match self.io_uring.submit_and_wait(1) {
+            let count = match self.inner.submit_and_wait(1) {
                 Ok(count) => count,
                 Err(err) => {
                     if err.raw_os_error() == Some(libc::EBUSY) {
@@ -143,14 +167,12 @@ impl IoUringOperator {
                     }
                 }
             };
-            let mut cq = unsafe { self.io_uring.completion_shared() };
             cq.sync();
 
             // clean backlog
-            let mut sq = unsafe { self.io_uring.submission_shared() };
             loop {
                 if sq.is_full() {
-                    match self.io_uring.submit() {
+                    match self.inner.submit() {
                         Ok(_) => (),
                         Err(err) => {
                             if err.raw_os_error() == Some(libc::EBUSY) {
@@ -165,7 +187,7 @@ impl IoUringOperator {
                 let mut backlog = self.backlog.lock().unwrap();
                 match backlog.pop_front() {
                     Some(sqe) => {
-                        if unsafe { sq.push(&sqe).is_err() } {
+                        if unsafe { sq.push(sqe).is_err() } {
                             backlog.push_front(sqe);
                             break;
                         }
@@ -174,8 +196,7 @@ impl IoUringOperator {
                 }
             }
             return Ok((count, cq));
-        }
-        Err(Error::new(ErrorKind::Unsupported, "unsupported"))
+        })
     }
 
     /// poll
@@ -188,7 +209,7 @@ impl IoUringOperator {
         fd: c_int,
         event: *mut libc::epoll_event,
     ) -> std::io::Result<()> {
-        if *SUPPORT_EPOLL_CTL {
+        impl_if_support!(*SUPPORT_EPOLL_CTL, {
             let entry = EpollCtl::new(
                 Fd(epfd),
                 Fd(fd),
@@ -197,47 +218,39 @@ impl IoUringOperator {
             )
             .build()
             .user_data(user_data as u64);
-            self.push_sq(entry);
-            return Ok(());
-        }
-        Err(Error::new(ErrorKind::Unsupported, "unsupported"))
+            return self.push_sq(entry);
+        })
     }
 
     pub fn poll_add(&self, user_data: usize, fd: c_int, flags: c_int) -> std::io::Result<()> {
-        if *SUPPORT_POLL_ADD {
+        impl_if_support!(*SUPPORT_POLL_ADD, {
             let entry = PollAdd::new(Fd(fd), flags as u32)
                 .build()
                 .user_data(user_data as u64);
-            self.push_sq(entry);
-            return Ok(());
-        }
-        Err(Error::new(ErrorKind::Unsupported, "unsupported"))
+            return self.push_sq(entry);
+        })
     }
 
     pub fn poll_remove(&self, user_data: usize) -> std::io::Result<()> {
-        if *SUPPORT_POLL_REMOVE {
+        impl_if_support!(*SUPPORT_POLL_REMOVE, {
             let entry = PollRemove::new(user_data as u64)
                 .build()
                 .user_data(user_data as u64);
-            self.push_sq(entry);
-            return Ok(());
-        }
-        Err(Error::new(ErrorKind::Unsupported, "unsupported"))
+            return self.push_sq(entry);
+        })
     }
 
     /// timeout
 
     pub fn timeout_add(&self, user_data: usize, timeout: Option<Duration>) -> std::io::Result<()> {
         if let Some(duration) = timeout {
-            if *SUPPORT_TIMEOUT_ADD {
+            impl_if_support!(*SUPPORT_TIMEOUT_ADD, {
                 let timeout = Timespec::new()
                     .sec(duration.as_secs())
                     .nsec(duration.subsec_nanos());
                 let entry = Timeout::new(&timeout).build().user_data(user_data as u64);
-                self.push_sq(entry);
-                return Ok(());
-            }
-            return Err(Error::new(ErrorKind::Unsupported, "unsupported"));
+                return self.push_sq(entry);
+            })
         }
         Ok(())
     }
@@ -248,28 +261,24 @@ impl IoUringOperator {
         timeout: Option<Duration>,
     ) -> std::io::Result<()> {
         if let Some(duration) = timeout {
-            if *SUPPORT_TIMEOUT_UPDATE {
+            impl_if_support!(*SUPPORT_TIMEOUT_UPDATE, {
                 let timeout = Timespec::new()
                     .sec(duration.as_secs())
                     .nsec(duration.subsec_nanos());
                 let entry = TimeoutUpdate::new(user_data as u64, &timeout)
                     .build()
                     .user_data(user_data as u64);
-                self.push_sq(entry);
-                return Ok(());
-            }
-            return Err(Error::new(ErrorKind::Unsupported, "unsupported"));
+                return self.push_sq(entry);
+            })
         }
         self.timeout_remove(user_data)
     }
 
     pub fn timeout_remove(&self, user_data: usize) -> std::io::Result<()> {
-        if *SUPPORT_TIMEOUT_REMOVE {
+        impl_if_support!(*SUPPORT_TIMEOUT_REMOVE, {
             let entry = TimeoutRemove::new(user_data as u64).build();
-            self.push_sq(entry);
-            return Ok(());
-        }
-        Err(Error::new(ErrorKind::Unsupported, "unsupported"))
+            return self.push_sq(entry);
+        })
     }
 
     /// file IO
@@ -282,16 +291,14 @@ impl IoUringOperator {
         flags: c_int,
         mode: mode_t,
     ) -> std::io::Result<()> {
-        if *SUPPORT_OPENAT {
+        impl_if_support!(*SUPPORT_OPENAT, {
             let entry = OpenAt::new(Fd(dir_fd), pathname)
                 .flags(flags)
                 .mode(mode)
                 .build()
                 .user_data(user_data as u64);
-            self.push_sq(entry);
-            return Ok(());
-        }
-        Err(Error::new(ErrorKind::Unsupported, "unsupported"))
+            return self.push_sq(entry);
+        })
     }
 
     pub fn mkdirat(
@@ -301,15 +308,13 @@ impl IoUringOperator {
         pathname: *const c_char,
         mode: mode_t,
     ) -> std::io::Result<()> {
-        if *SUPPORT_MK_DIR_AT {
+        impl_if_support!(*SUPPORT_MK_DIR_AT, {
             let entry = MkDirAt::new(Fd(dir_fd), pathname)
                 .mode(mode)
                 .build()
                 .user_data(user_data as u64);
-            self.push_sq(entry);
-            return Ok(());
-        }
-        Err(Error::new(ErrorKind::Unsupported, "unsupported"))
+            return self.push_sq(entry);
+        })
     }
 
     pub fn renameat(
@@ -320,14 +325,12 @@ impl IoUringOperator {
         new_dir_fd: c_int,
         new_path: *const c_char,
     ) -> std::io::Result<()> {
-        if *SUPPORT_RENAME_AT {
+        impl_if_support!(*SUPPORT_RENAME_AT, {
             let entry = RenameAt::new(Fd(old_dir_fd), old_path, Fd(new_dir_fd), new_path)
                 .build()
                 .user_data(user_data as u64);
-            self.push_sq(entry);
-            return Ok(());
-        }
-        Err(Error::new(ErrorKind::Unsupported, "unsupported"))
+            return self.push_sq(entry);
+        })
     }
 
     pub fn renameat2(
@@ -339,24 +342,20 @@ impl IoUringOperator {
         new_path: *const c_char,
         flags: c_uint,
     ) -> std::io::Result<()> {
-        if *SUPPORT_RENAME_AT {
+        impl_if_support!(*SUPPORT_RENAME_AT, {
             let entry = RenameAt::new(Fd(old_dir_fd), old_path, Fd(new_dir_fd), new_path)
                 .flags(flags)
                 .build()
                 .user_data(user_data as u64);
-            self.push_sq(entry);
-            return Ok(());
-        }
-        Err(Error::new(ErrorKind::Unsupported, "unsupported"))
+            return self.push_sq(entry);
+        })
     }
 
     pub fn fsync(&self, user_data: usize, fd: c_int) -> std::io::Result<()> {
-        if *SUPPORT_FSYNC {
+        impl_if_support!(*SUPPORT_FSYNC, {
             let entry = Fsync::new(Fd(fd)).build().user_data(user_data as u64);
-            self.push_sq(entry);
-            return Ok(());
-        }
-        Err(Error::new(ErrorKind::Unsupported, "unsupported"))
+            return self.push_sq(entry);
+        })
     }
 
     /// socket
@@ -368,14 +367,12 @@ impl IoUringOperator {
         ty: c_int,
         protocol: c_int,
     ) -> std::io::Result<()> {
-        if *SUPPORT_SOCKET {
+        impl_if_support!(*SUPPORT_SOCKET, {
             let entry = Socket::new(domain, ty, protocol)
                 .build()
                 .user_data(user_data as u64);
-            self.push_sq(entry);
-            return Ok(());
-        }
-        Err(Error::new(ErrorKind::Unsupported, "unsupported"))
+            return self.push_sq(entry);
+        })
     }
 
     pub fn accept(
@@ -385,14 +382,12 @@ impl IoUringOperator {
         address: *mut sockaddr,
         address_len: *mut socklen_t,
     ) -> std::io::Result<()> {
-        if *SUPPORT_ACCEPT {
+        impl_if_support!(*SUPPORT_ACCEPT, {
             let entry = Accept::new(Fd(socket), address, address_len)
                 .build()
                 .user_data(user_data as u64);
-            self.push_sq(entry);
-            return Ok(());
-        }
-        Err(Error::new(ErrorKind::Unsupported, "unsupported"))
+            return self.push_sq(entry);
+        })
     }
 
     pub fn accept4(
@@ -403,15 +398,13 @@ impl IoUringOperator {
         len: *mut socklen_t,
         flg: c_int,
     ) -> std::io::Result<()> {
-        if *SUPPORT_ACCEPT {
+        impl_if_support!(*SUPPORT_ACCEPT, {
             let entry = Accept::new(Fd(fd), addr, len)
                 .flags(flg)
                 .build()
                 .user_data(user_data as u64);
-            self.push_sq(entry);
-            return Ok(());
-        }
-        Err(Error::new(ErrorKind::Unsupported, "unsupported"))
+            return self.push_sq(entry);
+        })
     }
 
     pub fn connect(
@@ -421,34 +414,28 @@ impl IoUringOperator {
         address: *const sockaddr,
         len: socklen_t,
     ) -> std::io::Result<()> {
-        if *SUPPORT_CONNECT {
+        impl_if_support!(*SUPPORT_CONNECT, {
             let entry = Connect::new(Fd(socket), address, len)
                 .build()
                 .user_data(user_data as u64);
-            self.push_sq(entry);
-            return Ok(());
-        }
-        Err(Error::new(ErrorKind::Unsupported, "unsupported"))
+            return self.push_sq(entry);
+        })
     }
 
     pub fn shutdown(&self, user_data: usize, socket: c_int, how: c_int) -> std::io::Result<()> {
-        if *SUPPORT_SHUTDOWN {
+        impl_if_support!(*SUPPORT_SHUTDOWN, {
             let entry = Shutdown::new(Fd(socket), how)
                 .build()
                 .user_data(user_data as u64);
-            self.push_sq(entry);
-            return Ok(());
-        }
-        Err(Error::new(ErrorKind::Unsupported, "unsupported"))
+            return self.push_sq(entry);
+        })
     }
 
     pub fn close(&self, user_data: usize, fd: c_int) -> std::io::Result<()> {
-        if *SUPPORT_CLOSE {
+        impl_if_support!(*SUPPORT_CLOSE, {
             let entry = Close::new(Fd(fd)).build().user_data(user_data as u64);
-            self.push_sq(entry);
-            return Ok(());
-        }
-        Err(Error::new(ErrorKind::Unsupported, "unsupported"))
+            return self.push_sq(entry);
+        })
     }
 
     /// read
@@ -461,15 +448,13 @@ impl IoUringOperator {
         len: size_t,
         flags: c_int,
     ) -> std::io::Result<()> {
-        if *SUPPORT_RECV {
+        impl_if_support!(*SUPPORT_RECV, {
             let entry = Recv::new(Fd(socket), buf.cast::<u8>(), len as u32)
                 .flags(flags)
                 .build()
                 .user_data(user_data as u64);
-            self.push_sq(entry);
-            return Ok(());
-        }
-        Err(Error::new(ErrorKind::Unsupported, "unsupported"))
+            return self.push_sq(entry);
+        })
     }
 
     pub fn read(
@@ -479,14 +464,12 @@ impl IoUringOperator {
         buf: *mut c_void,
         count: size_t,
     ) -> std::io::Result<()> {
-        if *SUPPORT_READ {
+        impl_if_support!(*SUPPORT_READ, {
             let entry = Read::new(Fd(fd), buf.cast::<u8>(), count as u32)
                 .build()
                 .user_data(user_data as u64);
-            self.push_sq(entry);
-            return Ok(());
-        }
-        Err(Error::new(ErrorKind::Unsupported, "unsupported"))
+            return self.push_sq(entry);
+        })
     }
 
     pub fn pread(
@@ -497,15 +480,13 @@ impl IoUringOperator {
         count: size_t,
         offset: off_t,
     ) -> std::io::Result<()> {
-        if *SUPPORT_READ {
+        impl_if_support!(*SUPPORT_READ, {
             let entry = Read::new(Fd(fd), buf.cast::<u8>(), count as u32)
                 .offset(offset as u64)
                 .build()
                 .user_data(user_data as u64);
-            self.push_sq(entry);
-            return Ok(());
-        }
-        Err(Error::new(ErrorKind::Unsupported, "unsupported"))
+            return self.push_sq(entry);
+        })
     }
 
     pub fn readv(
@@ -515,14 +496,12 @@ impl IoUringOperator {
         iov: *const iovec,
         iovcnt: c_int,
     ) -> std::io::Result<()> {
-        if *SUPPORT_READV {
+        impl_if_support!(*SUPPORT_READV, {
             let entry = Readv::new(Fd(fd), iov, iovcnt as u32)
                 .build()
                 .user_data(user_data as u64);
-            self.push_sq(entry);
-            return Ok(());
-        }
-        Err(Error::new(ErrorKind::Unsupported, "unsupported"))
+            return self.push_sq(entry);
+        })
     }
 
     pub fn preadv(
@@ -533,15 +512,13 @@ impl IoUringOperator {
         iovcnt: c_int,
         offset: off_t,
     ) -> std::io::Result<()> {
-        if *SUPPORT_READV {
+        impl_if_support!(*SUPPORT_READV, {
             let entry = Readv::new(Fd(fd), iov, iovcnt as u32)
                 .offset(offset as u64)
                 .build()
                 .user_data(user_data as u64);
-            self.push_sq(entry);
-            return Ok(());
-        }
-        Err(Error::new(ErrorKind::Unsupported, "unsupported"))
+            return self.push_sq(entry);
+        })
     }
 
     pub fn recvmsg(
@@ -551,15 +528,13 @@ impl IoUringOperator {
         msg: *mut msghdr,
         flags: c_int,
     ) -> std::io::Result<()> {
-        if *SUPPORT_RECVMSG {
+        impl_if_support!(*SUPPORT_RECVMSG, {
             let entry = RecvMsg::new(Fd(fd), msg)
                 .flags(flags as u32)
                 .build()
                 .user_data(user_data as u64);
-            self.push_sq(entry);
-            return Ok(());
-        }
-        Err(Error::new(ErrorKind::Unsupported, "unsupported"))
+            return self.push_sq(entry);
+        })
     }
 
     /// write
@@ -572,15 +547,35 @@ impl IoUringOperator {
         len: size_t,
         flags: c_int,
     ) -> std::io::Result<()> {
-        if *SUPPORT_SEND {
+        impl_if_support!(*SUPPORT_SEND, {
             let entry = Send::new(Fd(socket), buf.cast::<u8>(), len as u32)
                 .flags(flags)
                 .build()
                 .user_data(user_data as u64);
-            self.push_sq(entry);
-            return Ok(());
-        }
-        Err(Error::new(ErrorKind::Unsupported, "unsupported"))
+            return self.push_sq(entry);
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn sendto(
+        &self,
+        user_data: usize,
+        socket: c_int,
+        buf: *const c_void,
+        len: size_t,
+        flags: c_int,
+        addr: *const sockaddr,
+        addrlen: socklen_t,
+    ) -> std::io::Result<()> {
+        impl_if_support!(*SUPPORT_SEND_ZC, {
+            let entry = SendZc::new(Fd(socket), buf.cast::<u8>(), len as u32)
+                .flags(flags)
+                .dest_addr(addr)
+                .dest_addr_len(addrlen)
+                .build()
+                .user_data(user_data as u64);
+            return self.push_sq(entry);
+        })
     }
 
     pub fn write(
@@ -590,14 +585,12 @@ impl IoUringOperator {
         buf: *const c_void,
         count: size_t,
     ) -> std::io::Result<()> {
-        if *SUPPORT_WRITE {
+        impl_if_support!(*SUPPORT_WRITE, {
             let entry = Write::new(Fd(fd), buf.cast::<u8>(), count as u32)
                 .build()
                 .user_data(user_data as u64);
-            self.push_sq(entry);
-            return Ok(());
-        }
-        Err(Error::new(ErrorKind::Unsupported, "unsupported"))
+            return self.push_sq(entry);
+        })
     }
 
     pub fn pwrite(
@@ -608,15 +601,13 @@ impl IoUringOperator {
         count: size_t,
         offset: off_t,
     ) -> std::io::Result<()> {
-        if *SUPPORT_WRITE {
+        impl_if_support!(*SUPPORT_WRITE, {
             let entry = Write::new(Fd(fd), buf.cast::<u8>(), count as u32)
                 .offset(offset as u64)
                 .build()
                 .user_data(user_data as u64);
-            self.push_sq(entry);
-            return Ok(());
-        }
-        Err(Error::new(ErrorKind::Unsupported, "unsupported"))
+            return self.push_sq(entry);
+        })
     }
 
     pub fn writev(
@@ -626,14 +617,12 @@ impl IoUringOperator {
         iov: *const iovec,
         iovcnt: c_int,
     ) -> std::io::Result<()> {
-        if *SUPPORT_WRITEV {
+        impl_if_support!(*SUPPORT_WRITEV, {
             let entry = Writev::new(Fd(fd), iov, iovcnt as u32)
                 .build()
                 .user_data(user_data as u64);
-            self.push_sq(entry);
-            return Ok(());
-        }
-        Err(Error::new(ErrorKind::Unsupported, "unsupported"))
+            return self.push_sq(entry);
+        })
     }
 
     pub fn pwritev(
@@ -644,15 +633,13 @@ impl IoUringOperator {
         iovcnt: c_int,
         offset: off_t,
     ) -> std::io::Result<()> {
-        if *SUPPORT_WRITEV {
+        impl_if_support!(*SUPPORT_WRITEV, {
             let entry = Writev::new(Fd(fd), iov, iovcnt as u32)
                 .offset(offset as u64)
                 .build()
                 .user_data(user_data as u64);
-            self.push_sq(entry);
-            return Ok(());
-        }
-        Err(Error::new(ErrorKind::Unsupported, "unsupported"))
+            return self.push_sq(entry);
+        })
     }
 
     pub fn sendmsg(
@@ -662,14 +649,12 @@ impl IoUringOperator {
         msg: *const msghdr,
         flags: c_int,
     ) -> std::io::Result<()> {
-        if *SUPPORT_SENDMSG {
+        impl_if_support!(*SUPPORT_SENDMSG, {
             let entry = SendMsg::new(Fd(fd), msg)
                 .flags(flags as u32)
                 .build()
                 .user_data(user_data as u64);
-            self.push_sq(entry);
-            return Ok(());
-        }
-        Err(Error::new(ErrorKind::Unsupported, "unsupported"))
+            return self.push_sq(entry);
+        })
     }
 }

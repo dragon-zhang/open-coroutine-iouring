@@ -2,9 +2,9 @@
 pub mod version;
 
 #[cfg(target_os = "linux")]
-pub mod io_uring;
+pub mod operator;
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use std::collections::VecDeque;
     use std::io::{BufRead, BufReader, Write};
@@ -15,7 +15,7 @@ mod tests {
     use std::time::Duration;
     use std::{io, ptr};
 
-    use crate::io_uring::IoUringOperator;
+    use crate::operator::Operator;
     use io_uring::{opcode, squeue, types, IoUring, SubmissionQueue};
     use slab::Slab;
 
@@ -255,7 +255,7 @@ mod tests {
         while !server_started.load(Ordering::Acquire) {}
         let socket = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port);
         let mut stream = TcpStream::connect_timeout(&socket, Duration::from_secs(3))
-            .unwrap_or_else(|_| panic!("connect to 127.0.0.1:3456 failed !"));
+            .unwrap_or_else(|_| panic!("connect to 127.0.0.1:{port} failed !"));
         let mut data: [u8; 512] = [b'1'; 512];
         data[511] = b'\n';
         let mut buffer: Vec<u8> = Vec::with_capacity(512);
@@ -294,7 +294,7 @@ mod tests {
     }
 
     pub fn crate_server2(port: u16, server_started: Arc<AtomicBool>) -> anyhow::Result<()> {
-        let operator = IoUringOperator::new(0)?;
+        let operator = Operator::new(0)?;
         let listener = TcpListener::bind(("127.0.0.1", port))?;
 
         let mut bufpool = Vec::with_capacity(64);
@@ -307,8 +307,8 @@ mod tests {
         operator.accept(
             token_alloc.insert(Token::Accept),
             listener.as_raw_fd(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
         )?;
 
         loop {

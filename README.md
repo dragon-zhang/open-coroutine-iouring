@@ -1,3 +1,8 @@
 # open-coroutine-iouring
 
-## This crate provide iouring support
+## Prerequisites
+
+install io_uring syscalls
+```bash
+sudo dnf install liburing-devel
+```
